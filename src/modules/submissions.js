@@ -483,7 +483,50 @@
 		return this.text;
 	};
 
-	AFCH.Text.prototype.cleanUp = function ( isAccept ) {
+	function getDraftArticleSubcatsInner( cat ) {
+		return new mw.Api().get( { action: 'query', list: 'categorymembers', cmtitle: 'Category:' + cat, cmtype: 'subcat' } ).then( function ( data ) {
+			return $.when.apply( $, data.query.categorymembers.map( function ( e ) {
+				var txt = e.title.replace( /Category:(.*?\s*)/gi, '$1' );
+				return getDraftArticleSubcatsInner( txt );
+			} ) ).then( function () {
+				var result = [ cat ];
+				Array.prototype.slice.call( arguments ).forEach( function ( e ) {
+					e.forEach( function ( ele ) {
+						if ( !result.includes( ele ) ) {
+							result.push( ele );
+						}
+					} );
+				} );
+				return result;
+			} );
+		} );
+	}
+
+	function getDraftArticleSubcats( cat ) {
+		var articleSubcats = [],
+			// This is so a new version of AFCH will invalidate the articleSubcats cache
+			lsKey = 'afch-' + AFCH.consts.version + 'draft-article-subcats';
+		if ( window.localStorage && window.localStorage[ lsKey ] ) {
+			articleSubcats = JSON.parse( window.localStorage[ lsKey ] );
+			return articleSubcats;
+		} else {
+			return getDraftArticleSubcatsInner( cat ).then( function ( articleSubcats ) { // there has to be a return here so that the function will return something
+				// If possible, cache the articleSubcats data!
+				if ( window.localStorage ) {
+					try {
+						window.localStorage[ lsKey ] = JSON.stringify( articleSubcats );
+					} catch ( e ) {
+						AFCH.log( 'Unable to cache articleSubcats list: ' + e.message );
+					}
+				}
+				return articleSubcats;
+			} ).fail( function ( jqxhr, textStatus, errorThrown ) {
+				console.error( 'Could not parse articleSubcats list: ', textStatus, errorThrown );
+			} );
+		}
+	}
+
+	AFCH.Text.prototype.cleanUp = function ( isAccept, draftArticleSubcats ) {
 		var text = this.text,
 			commentRegex,
 			commentsToRemove = [
@@ -533,7 +576,13 @@
 			] );
 		} else {
 			// If not yet accepted, comment out cats
-			text = text.replace( /\[\[Category:/gi, '[[:Category:' );
+			text = text.replace( /\[\[:?Category:(.*?\s*)\]\]/gi, function call( match, category ) {
+				if ( draftArticleSubcats.includes( category ) ) {
+					return '[[Category:' + category + ']]';
+				} else {
+					return '[[:Category:' + category + ']]';
+				}
+			} );
 		}
 
 		// Remove empty section at the end (caused by "Resubmit" button on "declined" template)
@@ -638,7 +687,7 @@
 		return this.prepend( newCode + '\n\n' );
 	};
 
-	AFCH.Text.prototype.updateCategories = function ( categories ) {
+	AFCH.Text.prototype.updateCategories = function ( categories, draftArticleSubcats ) {
 		// There's no "g" flag in categoryRegex, because we use it
 		// to delete its matches in a loop. If it were global, then
 		// it would internally keep track of lsatIndex - then given
@@ -650,9 +699,13 @@
 
 		// Create the wikicode block
 		$.each( categories, function ( _, category ) {
-			var trimmed = $.trim( category );
-			if ( trimmed ) {
-				newCategoryCode += '\n[[Category:' + trimmed + ']]';
+			if ( draftArticleSubcats.includes( category ) ) {
+				return;
+			} else {
+				var trimmed = $.trim( category );
+				if ( trimmed ) {
+					newCategoryCode += '\n[[Category:' + trimmed + ']]';
+				}
 			}
 		} );
 
@@ -2032,161 +2085,162 @@
 	function handleAccept( data ) {
 		var newText = data.afchText;
 
-		AFCH.actions.movePage( afchPage.rawTitle, data.newTitle,
+		$.when( AFCH.actions.movePage( afchPage.rawTitle, data.newTitle,
 			'Publishing accepted [[Wikipedia:Articles for creation|Articles for creation]] submission',
-			{ movetalk: true } ) // Also move associated talk page if exists (e.g. `Draft_talk:`)
-			.done( function ( moveData ) {
-				var $patrolLink,
-					newPage = new AFCH.Page( moveData.to ),
-					talkPage = newPage.getTalkPage(),
-					recentPage = new AFCH.Page( 'Wikipedia:Articles for creation/recent' );
+			{ movetalk: true } ), // Also move associated talk page if exists (e.g. `Draft_talk:`)
+		getDraftArticleSubcats( 'Draft articles' )
+		).done( function ( moveData, draftArticleSubcats ) {
+			var $patrolLink,
+				newPage = new AFCH.Page( moveData.to ),
+				talkPage = newPage.getTalkPage(),
+				recentPage = new AFCH.Page( 'Wikipedia:Articles for creation/recent' );
 
-				// ARTICLE
-				// -------
+			// ARTICLE
+			// -------
+			newText.updateCategories( data.newCategories, draftArticleSubcats );
 
-				newText.removeAfcTemplates();
+			newText.removeAfcTemplates();
+			// newText.updateCategories( data.newCategories );
 
-				newText.updateCategories( data.newCategories );
+			// Clean the page
+			newText.cleanUp( /* isAccept */ true, draftArticleSubcats );
 
-				// Clean the page
-				newText.cleanUp( /* isAccept */ true );
+			// Add biography details
+			if ( data.isBiography ) {
 
-				// Add biography details
-				if ( data.isBiography ) {
+				// {{subst:L}}, which generates DEFAULTSORT as well as
+				// adds the appropriate birth/death year categories
+				newText.append( '\n{{subst:L' +
+					'|1=' + data.birthYear +
+					'|2=' + ( data.deathYear || '' ) +
+					'|3=' + data.subjectName + '}}'
+				);
 
-					// {{subst:L}}, which generates DEFAULTSORT as well as
-					// adds the appropriate birth/death year categories
-					newText.append( '\n{{subst:L' +
-						'|1=' + data.birthYear +
-						'|2=' + ( data.deathYear || '' ) +
-						'|3=' + data.subjectName + '}}'
-					);
+			}
 
-				}
-
-				newPage.edit( {
-					contents: newText.get(),
-					summary: 'Cleaning up accepted [[Wikipedia:Articles for creation|Articles for creation]] submission'
-				} );
-
-				// Patrol the new page if desired
-				if ( data.patrolPage ) {
-					$patrolLink = $afch.find( '.patrollink' );
-					if ( $patrolLink.length ) {
-						AFCH.actions.patrolRcid(
-							mw.util.getParamValue( 'rcid', $patrolLink.find( 'a' ).attr( 'href' ) ),
-							newPage.rawTitle // Include the title for a prettier log message
-						);
-					}
-				}
-
-				// TALK PAGE
-				// ---------
-
-				talkPage.getText().done( function ( talkText ) {
-					var talkTextPrefix = '';
-
-					// Add the AFC banner
-					talkTextPrefix += '{{subst:WPAFC/article|class=' + data.newAssessment +
-						( afchPage.additionalData.revId ? '|oldid=' + afchPage.additionalData.revId : '' ) + '}}';
-
-					// Add biography banner if specified
-					if ( data.isBiography ) {
-						// Ensure we don't have duplicate biography tags
-						AFCH.removeFromArray( data.newWikiProjects, 'WikiProject Biography' );
-
-						talkTextPrefix += ( '\n{{WikiProject Biography|living=' +
-							( data.lifeStatus !== 'unknown' ? ( data.lifeStatus === 'living' ? 'yes' : 'no' ) : '' ) +
-							'|class=' + data.newAssessment + '|listas=' + data.subjectName + '}}' );
-					}
-
-					if ( data.newAssessment === 'disambig' &&
-						$.inArray( 'WikiProject Disambiguation', data.newWikiProjects ) === -1 ) {
-						data.newWikiProjects.push( 'WikiProject Disambiguation' );
-					}
-
-					// Add and remove WikiProjects
-					var wikiProjectsToAdd = data.newWikiProjects.filter( function ( newTemplateName ) {
-						return !data.existingWikiProjects.some( function ( existingTplObj ) {
-							return existingTplObj.templateName === newTemplateName;
-						} );
-					} );
-					var wikiProjectsToRemove = data.existingWikiProjects.filter( function ( existingTplObj ) {
-						return !data.newWikiProjects.some( function ( newTemplateName ) {
-							return existingTplObj.templateName === newTemplateName;
-						} );
-					} ).map( function ( templateObj ) {
-						return templateObj.realTemplateName || templateObj.templateName;
-					} );
-					if ( data.alreadyHasWPBio && !data.isBiography ) {
-						wikiProjectsToRemove.push( data.existingWPBioTemplateName || 'wikiproject biography' );
-					}
-
-					$.each( wikiProjectsToAdd, function ( _index, templateName ) {
-						talkTextPrefix += '\n{{' + templateName + '|class=' + data.newAssessment + '}}';
-					} );
-					$.each( wikiProjectsToRemove, function ( _index, templateName ) {
-						// Regex from https://stackoverflow.com/a/5306111/1757964
-						var sanitizedTemplateName = templateName.replace( /[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&' );
-						talkText = talkText.replace( new RegExp( '\\n?\\{\\{\\s*' + sanitizedTemplateName + '\\s*.+?\\}\\}', 'is' ), '' );
-					} );
-
-					// We prepend the text so that talk page content is not removed
-					// (e.g. pages in `Draft:` namespace with discussion)
-					talkText = talkTextPrefix + '\n\n' + talkText;
-
-					var summary = 'Placing [[Wikipedia:Articles for creation|Articles for creation]] banner';
-					if ( wikiProjectsToAdd.length > 0 ) {
-						summary += ', adding ' + wikiProjectsToAdd.length +
-							' WikiProject banner' + ( ( wikiProjectsToAdd.length === 1 ) ? '' : 's' );
-					}
-					if ( wikiProjectsToRemove.length > 0 ) {
-						summary += ', removing ' + wikiProjectsToRemove.length +
-							' WikiProject banner' + ( ( wikiProjectsToRemove.length === 1 ) ? '' : 's' );
-					}
-
-					talkPage.edit( {
-						contents: talkText,
-						summary: summary
-					} );
-				} );
-
-				// NOTIFY SUBMITTER
-				// ----------------
-
-				if ( data.notifyUser ) {
-					afchSubmission.getSubmitter().done( function ( submitter ) {
-						AFCH.actions.notifyUser( submitter, {
-							message: AFCH.msg.get( 'accepted-submission',
-								{ $1: newPage, $2: data.newAssessment } ),
-							summary: 'Notification: Your [[Wikipedia:Articles for creation|Articles for creation]] submission has been accepted'
-						} );
-					} );
-				}
-
-				// AFC/RECENT
-				// ----------
-
-				$.when( recentPage.getText(), afchSubmission.getSubmitter() )
-					.then( function ( text, submitter ) {
-						var newRecentText = text,
-							matches = text.match( /{{afc contrib.*?}}\s*/gi ),
-							newTemplate = '{{afc contrib|' + data.newAssessment + '|' + newPage + '|' + submitter + '}}\n';
-
-						// Remove the older entries (at bottom of the page) if necessary
-						// to ensure we keep only 10 entries at any given point in time
-						while ( matches.length >= 10 ) {
-							newRecentText = newRecentText.replace( matches.pop(), '' );
-						}
-
-						newRecentText = newTemplate + newRecentText;
-
-						recentPage.edit( {
-							contents: newRecentText,
-							summary: 'Adding [[' + newPage + ']] to list of recent AfC creations'
-						} );
-					} );
+			newPage.edit( {
+				contents: newText.get(),
+				summary: 'Cleaning up accepted [[Wikipedia:Articles for creation|Articles for creation]] submission'
 			} );
+
+			// Patrol the new page if desired
+			if ( data.patrolPage ) {
+				$patrolLink = $afch.find( '.patrollink' );
+				if ( $patrolLink.length ) {
+					AFCH.actions.patrolRcid(
+						mw.util.getParamValue( 'rcid', $patrolLink.find( 'a' ).attr( 'href' ) ),
+						newPage.rawTitle // Include the title for a prettier log message
+					);
+				}
+			}
+
+			// TALK PAGE
+			// ---------
+
+			talkPage.getText().done( function ( talkText ) {
+				var talkTextPrefix = '';
+
+				// Add the AFC banner
+				talkTextPrefix += '{{subst:WPAFC/article|class=' + data.newAssessment +
+					( afchPage.additionalData.revId ? '|oldid=' + afchPage.additionalData.revId : '' ) + '}}';
+
+				// Add biography banner if specified
+				if ( data.isBiography ) {
+					// Ensure we don't have duplicate biography tags
+					AFCH.removeFromArray( data.newWikiProjects, 'WikiProject Biography' );
+
+					talkTextPrefix += ( '\n{{WikiProject Biography|living=' +
+						( data.lifeStatus !== 'unknown' ? ( data.lifeStatus === 'living' ? 'yes' : 'no' ) : '' ) +
+						'|class=' + data.newAssessment + '|listas=' + data.subjectName + '}}' );
+				}
+
+				if ( data.newAssessment === 'disambig' &&
+					$.inArray( 'WikiProject Disambiguation', data.newWikiProjects ) === -1 ) {
+					data.newWikiProjects.push( 'WikiProject Disambiguation' );
+				}
+
+				// Add and remove WikiProjects
+				var wikiProjectsToAdd = data.newWikiProjects.filter( function ( newTemplateName ) {
+					return !data.existingWikiProjects.some( function ( existingTplObj ) {
+						return existingTplObj.templateName === newTemplateName;
+					} );
+				} );
+				var wikiProjectsToRemove = data.existingWikiProjects.filter( function ( existingTplObj ) {
+					return !data.newWikiProjects.some( function ( newTemplateName ) {
+						return existingTplObj.templateName === newTemplateName;
+					} );
+				} ).map( function ( templateObj ) {
+					return templateObj.realTemplateName || templateObj.templateName;
+				} );
+				if ( data.alreadyHasWPBio && !data.isBiography ) {
+					wikiProjectsToRemove.push( data.existingWPBioTemplateName || 'wikiproject biography' );
+				}
+
+				$.each( wikiProjectsToAdd, function ( _index, templateName ) {
+					talkTextPrefix += '\n{{' + templateName + '|class=' + data.newAssessment + '}}';
+				} );
+				$.each( wikiProjectsToRemove, function ( _index, templateName ) {
+					// Regex from https://stackoverflow.com/a/5306111/1757964
+					var sanitizedTemplateName = templateName.replace( /[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&' );
+					talkText = talkText.replace( new RegExp( '\\n?\\{\\{\\s*' + sanitizedTemplateName + '\\s*.+?\\}\\}', 'is' ), '' );
+				} );
+
+				// We prepend the text so that talk page content is not removed
+				// (e.g. pages in `Draft:` namespace with discussion)
+				talkText = talkTextPrefix + '\n\n' + talkText;
+
+				var summary = 'Placing [[Wikipedia:Articles for creation|Articles for creation]] banner';
+				if ( wikiProjectsToAdd.length > 0 ) {
+					summary += ', adding ' + wikiProjectsToAdd.length +
+						' WikiProject banner' + ( ( wikiProjectsToAdd.length === 1 ) ? '' : 's' );
+				}
+				if ( wikiProjectsToRemove.length > 0 ) {
+					summary += ', removing ' + wikiProjectsToRemove.length +
+						' WikiProject banner' + ( ( wikiProjectsToRemove.length === 1 ) ? '' : 's' );
+				}
+
+				talkPage.edit( {
+					contents: talkText,
+					summary: summary
+				} );
+			} );
+
+			// NOTIFY SUBMITTER
+			// ----------------
+
+			if ( data.notifyUser ) {
+				afchSubmission.getSubmitter().done( function ( submitter ) {
+					AFCH.actions.notifyUser( submitter, {
+						message: AFCH.msg.get( 'accepted-submission',
+							{ $1: newPage, $2: data.newAssessment } ),
+						summary: 'Notification: Your [[Wikipedia:Articles for creation|Articles for creation]] submission has been accepted'
+					} );
+				} );
+			}
+
+			// AFC/RECENT
+			// ----------
+
+			$.when( recentPage.getText(), afchSubmission.getSubmitter() )
+				.then( function ( text, submitter ) {
+					var newRecentText = text,
+						matches = text.match( /{{afc contrib.*?}}\s*/gi ),
+						newTemplate = '{{afc contrib|' + data.newAssessment + '|' + newPage + '|' + submitter + '}}\n';
+
+					// Remove the older entries (at bottom of the page) if necessary
+					// to ensure we keep only 10 entries at any given point in time
+					while ( matches.length >= 10 ) {
+						newRecentText = newRecentText.replace( matches.pop(), '' );
+					}
+
+					newRecentText = newTemplate + newRecentText;
+
+					recentPage.edit( {
+						contents: newRecentText,
+						summary: 'Adding [[' + newPage + ']] to list of recent AfC creations'
+					} );
+				} );
+		} );
 	}
 
 	function handleDecline( data ) {
@@ -2455,15 +2509,14 @@
 
 	function handleCleanup() {
 		prepareForProcessing( 'Cleaning' );
-
-		afchPage.getText( false ).done( function ( rawText ) {
+		$.when( afchPage.getText( false ), getDraftArticleSubcats( 'Draft articles' ) ).done( function ( rawText, draftArticleSubcats ) {
 			var text = new AFCH.Text( rawText );
 
 			// Even though we didn't modify them, still update the templates,
 			// because the order may have changed/been corrected
 			text.updateAfcTemplates( afchSubmission.makeWikicode() );
 
-			text.cleanUp();
+			text.cleanUp( draftArticleSubcats );
 
 			afchPage.edit( {
 				contents: text.get(),
